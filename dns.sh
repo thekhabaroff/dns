@@ -451,15 +451,27 @@ if command -v networkctl >/dev/null 2>&1 \
     fi
 fi
 
-# Step 6: рестарт systemd-resolved + повторный revert per-link.
-# Делаем revert ПОСЛЕ networkd-reconfigure, чтобы вычистить кэш
-# per-link DNS, а не зацепить новые настройки.
+# Step 6: рестарт systemd-resolved и принудительная установка per-link DNS.
+# Тонкий момент: netplan/systemd-networkd при наличии секции `nameservers:`
+# в /etc/netplan/*.yaml пишут [Network] DNS=... в .network-юнит, и
+# `resolvectl revert` сбрасывает per-link DNS именно к этим значениям —
+# то есть к netplan-овским, а не к выбранным нами. Так как у активного
+# интерфейса +DefaultRoute, per-link DNS имеет приоритет над Global,
+# и фактический резолв идёт через netplan-овские DNS.
+#
+# Поэтому: revert (сброс кэша + старой DHCP-аренды), затем `resolvectl dns`
+# с нашими серверами — это переопределяет per-link DNS принудительно,
+# независимо от netplan. Сохраняется до следующего reconfigure линка
+# (например, ребута или `netplan apply`).
 systemctl restart systemd-resolved
 echo -e "${GREEN}✓ systemd-resolved перезапущен.${NC}"
 
 if command -v resolvectl >/dev/null 2>&1; then
-    if resolvectl revert "$INTERFACE" 2>/dev/null; then
-        echo -e "${GREEN}✓ Per-link DNS сброшен на $INTERFACE.${NC}"
+    resolvectl revert "$INTERFACE" 2>/dev/null || true
+    if resolvectl dns "$INTERFACE" "$DNS1" "$DNS2" 2>/dev/null; then
+        echo -e "${GREEN}✓ Per-link DNS на $INTERFACE: $DNS1 $DNS2.${NC}"
+    else
+        echo -e "${YELLOW}⚠ Не удалось задать per-link DNS на $INTERFACE через resolvectl.${NC}"
     fi
     resolvectl flush-caches 2>/dev/null || true
 fi
