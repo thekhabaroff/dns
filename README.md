@@ -7,7 +7,7 @@ NetworkManager и dhclient перетереть настройки.
 ## Установка
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/thekhabaroff/dns/main/dns.sh \
+curl -fsSL https://raw.githubusercontent.com/thekhabaroff/dns/master/dns.sh \
   -o /usr/local/bin/dns && chmod +x /usr/local/bin/dns && sudo dns
 ```
 
