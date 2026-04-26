@@ -416,16 +416,7 @@ if [ -f "$DHCLIENT_CONF" ]; then
     echo -e "${GREEN}✓ dhclient зафиксирован на $DNS1, $DNS2.${NC}"
 fi
 
-# Step 3: сбросить per-link DNS на интерфейсе
-if command -v resolvectl >/dev/null 2>&1; then
-    if resolvectl revert "$INTERFACE" 2>/dev/null; then
-        echo -e "${GREEN}✓ Per-link DNS сброшен на $INTERFACE.${NC}"
-    else
-        echo -e "${YELLOW}⚠ Не удалось сбросить per-link DNS на $INTERFACE.${NC}"
-    fi
-fi
-
-# Step 4: единственный источник правды — /etc/systemd/resolved.conf.
+# Step 3: единственный источник правды — /etc/systemd/resolved.conf.
 # Чужие drop-in'ы в /etc/systemd/resolved.conf.d/ с DNS=/FallbackDNS=
 # мерджатся с нашим конфигом, поэтому мы их временно отключаем
 # (переименовываем; --rollback вернёт обратно). nofallback.conf —
@@ -444,13 +435,36 @@ Cache=yes
 EOF
 echo -e "${GREEN}✓ /etc/systemd/resolved.conf обновлён.${NC}"
 
+# Step 4: запретить systemd-networkd принимать DNS из DHCP/RA на интерфейсе.
+configure_networkd_no_dns
+
+# Step 5: применить новые настройки networkd к УЖЕ работающему линку.
+# `systemctl restart systemd-networkd` сам по себе не перенастраивает
+# активные интерфейсы — старая DHCP-аренда и кэш per-link DNS остаются.
+# `networkctl reload && networkctl reconfigure` форсируют пере-сборку
+# конфигурации интерфейса с учётом нового drop-in (UseDNS=no).
+if command -v networkctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+    networkctl reload 2>/dev/null || true
+    if networkctl reconfigure "$INTERFACE" 2>/dev/null; then
+        echo -e "${GREEN}✓ networkctl reconfigure $INTERFACE.${NC}"
+    fi
+fi
+
+# Step 6: рестарт systemd-resolved + повторный revert per-link.
+# Делаем revert ПОСЛЕ networkd-reconfigure, чтобы вычистить кэш
+# per-link DNS, а не зацепить новые настройки.
 systemctl restart systemd-resolved
 echo -e "${GREEN}✓ systemd-resolved перезапущен.${NC}"
 
-# Step 4b: запретить systemd-networkd принимать DNS из DHCP/RA на интерфейсе.
-configure_networkd_no_dns
+if command -v resolvectl >/dev/null 2>&1; then
+    if resolvectl revert "$INTERFACE" 2>/dev/null; then
+        echo -e "${GREEN}✓ Per-link DNS сброшен на $INTERFACE.${NC}"
+    fi
+    resolvectl flush-caches 2>/dev/null || true
+fi
 
-# Step 5: stub-резолвер
+# Step 7: stub-резолвер
 if [ -e /etc/resolv.conf ] && is_immutable /etc/resolv.conf; then
     echo -e "${YELLOW}⚠ /etc/resolv.conf был immutable (chattr +i). Снимаю флаг.${NC}"
     echo -e "${YELLOW}  После замены на симлинк +i обратно не ставится — это ожидаемо.${NC}"
