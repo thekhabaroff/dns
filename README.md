@@ -47,13 +47,23 @@ dns --help
 3. Если есть `/etc/dhcp/dhclient.conf` — добавляет/обновляет строку
    `supersede domain-name-servers …`.
 4. Сбрасывает per-link DNS на интерфейсе через `resolvectl revert`.
-5. Перезаписывает `/etc/systemd/resolved.conf` блоком `[Resolve]` с
+5. Отключает «чужие» drop-in'ы в `/etc/systemd/resolved.conf.d/`,
+   которые задают `DNS=`/`FallbackDNS=` (systemd-resolved их
+   **сливает** с основным конфигом — без этого в `resolvectl status`
+   появляются «лишние» серверы). Файлы переименовываются в
+   `*.disabled-by-dns-sh` и возвращаются обратно при `--rollback`.
+6. Перезаписывает `/etc/systemd/resolved.conf` блоком `[Resolve]` с
    `DNS=`, `FallbackDNS=`, опционально `DNSOverTLS=opportunistic` и
    `DNSSEC=allow-downgrade` (при `--dot`).
-6. Перезапускает `systemd-resolved` и делает симлинк
+7. Перезапускает `systemd-resolved` и делает симлинк
    `/etc/resolv.conf → /run/systemd/resolve/stub-resolv.conf` (127.0.0.53).
-7. Проверяет результат через `resolvectl status` и резолвинг тестового
-   домена (`resolvectl query` → `dig` → `getent hosts` → `nslookup`).
+8. Если активен `systemd-networkd` — кладёт drop-in
+   `/etc/systemd/network/<unit>.d/no-dhcp-dns.conf` с `[DHCP] UseDNS=no`
+   и `[IPv6AcceptRA] UseDNS=no` для интерфейса по умолчанию, чтобы
+   DHCP/RA-сервер хостера не подсовывал свои DNS на ссылку.
+9. Проверяет результат через `resolvectl status` и резолвинг тестового
+   домена (`resolvectl query` → `dig` → `getent hosts` → `nslookup`),
+   печатает список конфигов, которые сейчас влияют на DNS.
 
 ### Предупреждения о netplan и cloud-init
 
@@ -81,6 +91,11 @@ sudo dns --rollback
 - удаляет `/etc/systemd/resolved.conf.d/nofallback.conf` (если остался
   от старой версии скрипта) и `99-disable-network-config.cfg` для
   cloud-init;
+- **возвращает** ранее отключённые drop-in'ы
+  `*.disabled-by-dns-sh` → `*.conf` обратно;
+- удаляет наши systemd-networkd drop-in'ы
+  `/etc/systemd/network/<unit>.d/no-dhcp-dns.conf` и перезапускает
+  `systemd-networkd`;
 - сбрасывает `/etc/systemd/resolved.conf` к минимальному дефолту;
 - делает `resolvectl revert <iface>` и перезапускает `systemd-resolved`.
 

@@ -139,6 +139,138 @@ is_immutable() {
     lsattr "$f" 2>/dev/null | awk '{print $1}' | grep -q i
 }
 
+# Отключить чужие drop-in'ы в /etc/systemd/resolved.conf.d/, которые
+# содержат DNS=/FallbackDNS= и потому МЕРДЖАТСЯ с нашим основным конфигом.
+# Файлы переименовываются (а не удаляются), чтобы --rollback мог их вернуть.
+disable_conflicting_resolved_dropins() {
+    local dir="/etc/systemd/resolved.conf.d"
+    [ -d "$dir" ] || return 0
+    local f base
+    for f in "$dir"/*.conf; do
+        [ -f "$f" ] || continue
+        base="$(basename "$f")"
+        # nofallback.conf — артефакт прежней версии, удаляем безусловно ниже.
+        [ "$base" = "nofallback.conf" ] && continue
+        if grep -Eq '^[[:space:]]*(DNS|FallbackDNS)=' "$f"; then
+            mv -f "$f" "$f.disabled-by-dns-sh"
+            echo -e "${YELLOW}⚠ Отключён конфликтующий drop-in: $f→.disabled-by-dns-sh${NC}"
+        fi
+    done
+}
+
+# Восстановить drop-in'ы, которые мы переименовали.
+restore_resolved_dropins() {
+    local dir="/etc/systemd/resolved.conf.d"
+    [ -d "$dir" ] || return 0
+    local f orig
+    for f in "$dir"/*.disabled-by-dns-sh; do
+        [ -f "$f" ] || continue
+        orig="${f%.disabled-by-dns-sh}"
+        mv -f "$f" "$orig"
+        echo -e "${GREEN}✓ Восстановлен drop-in: $orig${NC}"
+    done
+}
+
+# Найти .network-файл, по которому systemd-networkd сконфигурировал интерфейс.
+find_networkd_unit() {
+    local iface="$1" netfile=""
+    if command -v networkctl >/dev/null 2>&1; then
+        netfile=$(networkctl status "$iface" 2>/dev/null \
+            | awk -F': +' '/Network File:/ {print $2; exit}')
+    fi
+    if [ -z "$netfile" ] || [ ! -f "$netfile" ]; then
+        netfile=$(grep -lE "^Name=$iface([[:space:]]|$)" \
+            /run/systemd/network/*.network /etc/systemd/network/*.network \
+            2>/dev/null | head -1)
+    fi
+    echo "$netfile"
+}
+
+# Создать drop-in для активного .network-юнита, запрещающий принимать DNS
+# от DHCP/RA на нашем интерфейсе. Срабатывает только если активен
+# systemd-networkd. NetworkManager ловится отдельно (no-dns.conf).
+configure_networkd_no_dns() {
+    if ! command -v systemctl >/dev/null 2>&1; then return 0; fi
+    if ! systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        return 0
+    fi
+    local netfile
+    netfile="$(find_networkd_unit "$INTERFACE")"
+    if [ -z "$netfile" ]; then
+        echo -e "${YELLOW}⚠ systemd-networkd активен, но .network для $INTERFACE не найден — UseDNS=no не применяю.${NC}"
+        return 0
+    fi
+    local base conf_dir
+    base="$(basename "$netfile")"
+    conf_dir="/etc/systemd/network/${base}.d"
+    mkdir -p "$conf_dir"
+    cat > "$conf_dir/no-dhcp-dns.conf" <<'EOF'
+# Создан dns.sh: запрещает DHCP/RA подсовывать свои DNS.
+[DHCP]
+UseDNS=no
+[IPv6AcceptRA]
+UseDNS=no
+EOF
+    echo -e "${GREEN}✓ systemd-networkd: $conf_dir/no-dhcp-dns.conf → UseDNS=no.${NC}"
+    systemctl restart systemd-networkd 2>/dev/null || true
+}
+
+# Удалить наши systemd-networkd drop-in'ы (для --rollback).
+remove_networkd_no_dns() {
+    local d removed=0
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if [ -f "$d/no-dhcp-dns.conf" ]; then
+            rm -f "$d/no-dhcp-dns.conf"
+            rmdir "$d" 2>/dev/null || true
+            echo -e "${GREEN}✓ Удалён $d/no-dhcp-dns.conf${NC}"
+            removed=1
+        fi
+    done < <(find /etc/systemd/network -maxdepth 1 -type d -name '*.network.d' 2>/dev/null)
+    if [ "$removed" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl restart systemd-networkd 2>/dev/null || true
+    fi
+}
+
+# Показать сводку, чтобы не было сюрпризов «откуда взялся 8.8.8.8».
+print_dns_layout() {
+    echo -e "${CYAN}Конфиги, влияющие на DNS:${NC}"
+    echo -e "  /etc/systemd/resolved.conf"
+    if compgen -G "/etc/systemd/resolved.conf.d/*.conf" >/dev/null 2>&1; then
+        local f
+        for f in /etc/systemd/resolved.conf.d/*.conf; do
+            echo -e "  $f"
+        done
+    fi
+    if compgen -G "/etc/systemd/resolved.conf.d/*.disabled-by-dns-sh" >/dev/null 2>&1; then
+        local f
+        for f in /etc/systemd/resolved.conf.d/*.disabled-by-dns-sh; do
+            echo -e "  $f  ${YELLOW}(отключён)${NC}"
+        done
+    fi
+    if compgen -G "/etc/netplan/*.yaml" >/dev/null 2>&1; then
+        local f
+        for f in /etc/netplan/*.yaml; do
+            if grep -qE '^[[:space:]]*nameservers[[:space:]]*:' "$f" 2>/dev/null; then
+                echo -e "  $f  ${YELLOW}(содержит nameservers:)${NC}"
+            fi
+        done
+    fi
+    if command -v systemctl >/dev/null 2>&1 \
+            && systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+        local netfile
+        netfile="$(find_networkd_unit "$INTERFACE")"
+        if [ -n "$netfile" ]; then
+            echo -e "  $netfile"
+            local base
+            base="$(basename "$netfile")"
+            if [ -f "/etc/systemd/network/${base}.d/no-dhcp-dns.conf" ]; then
+                echo -e "  /etc/systemd/network/${base}.d/no-dhcp-dns.conf"
+            fi
+        fi
+    fi
+}
+
 # ------------------------------------------------------------
 # rollback
 # ------------------------------------------------------------
@@ -160,6 +292,9 @@ rollback() {
 
     rm -f /etc/systemd/resolved.conf.d/nofallback.conf
     rm -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+
+    restore_resolved_dropins
+    remove_networkd_no_dns
 
     cat > /etc/systemd/resolved.conf <<'EOF'
 # Восстановлено dns.sh --rollback (минимальный дефолт).
@@ -290,9 +425,13 @@ if command -v resolvectl >/dev/null 2>&1; then
     fi
 fi
 
-# Step 4: единственный источник правды — /etc/systemd/resolved.conf
-# (drop-in nofallback.conf удаляется, чтобы не было противоречий с FallbackDNS).
+# Step 4: единственный источник правды — /etc/systemd/resolved.conf.
+# Чужие drop-in'ы в /etc/systemd/resolved.conf.d/ с DNS=/FallbackDNS=
+# мерджатся с нашим конфигом, поэтому мы их временно отключаем
+# (переименовываем; --rollback вернёт обратно). nofallback.conf —
+# артефакт прежней версии скрипта, удаляем безусловно.
 rm -f /etc/systemd/resolved.conf.d/nofallback.conf
+disable_conflicting_resolved_dropins
 
 cat > /etc/systemd/resolved.conf <<EOF
 # Сгенерировано dns.sh ($LABEL).
@@ -307,6 +446,9 @@ echo -e "${GREEN}✓ /etc/systemd/resolved.conf обновлён.${NC}"
 
 systemctl restart systemd-resolved
 echo -e "${GREEN}✓ systemd-resolved перезапущен.${NC}"
+
+# Step 4b: запретить systemd-networkd принимать DNS из DHCP/RA на интерфейсе.
+configure_networkd_no_dns
 
 # Step 5: stub-резолвер
 if [ -e /etc/resolv.conf ] && is_immutable /etc/resolv.conf; then
@@ -328,6 +470,9 @@ resolvectl status 2>/dev/null | grep -E "DNS Servers|Fallback" | head -4 || true
 echo ""
 echo -e "${CYAN}Тест резолвинга ($TEST_DOMAIN):${NC}"
 test_resolve "$TEST_DOMAIN" || echo -e "${RED}⚠ Не удалось проверить резолвинг.${NC}"
+
+echo ""
+print_dns_layout
 
 echo ""
 echo -e "${GREEN}Готово! Установлен: $LABEL ($DNS1, $DNS2)${NC}"
