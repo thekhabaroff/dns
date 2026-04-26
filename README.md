@@ -21,6 +21,10 @@ sudo dns
 sudo dns -p cloudflare -y
 sudo dns -p quad9 --dot -y      # с DNS-over-TLS + DNSSEC=allow-downgrade
 
+# Явно указать интерфейс(ы) — иначе берутся все с default route
+sudo dns -p cloudflare -i eth0 -y
+sudo dns -p cloudflare -i eth0,eth1 -y
+
 # Откат всех изменений, сделанных скриптом
 sudo dns --rollback
 
@@ -39,8 +43,10 @@ dns --help
 
 ## Что делает скрипт
 
-1. Определяет интерфейс по умолчанию через таблицу маршрутизации
-   (`ip -4 route show default`, с фолбэком на IPv6).
+1. Определяет **все** интерфейсы с default route (IPv4 + IPv6) — на multi-WAN
+   машинах их может быть несколько, и каждый из них имеет +DefaultRoute,
+   а значит свой per-link DNS. Все они обрабатываются. Можно перекрыть
+   автоопределение флагом `-i/--interface`.
 2. Если установлен NetworkManager — кладёт drop-in
    `/etc/NetworkManager/conf.d/no-dns.conf` (`dns=none`,
    `systemd-resolved=false`) и **перезапускает** NM.

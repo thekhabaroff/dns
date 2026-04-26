@@ -20,6 +20,10 @@ Usage: $SCRIPT_NAME [options]
 Options:
   -p, --provider <name>   Выбрать DNS-провайдер без меню:
                             yandex | cloudflare | google | quad9
+  -i, --interface <iface> Обработать только этот интерфейс (можно
+                            повторять или списком через запятую).
+                            По умолчанию берём все интерфейсы
+                            с default route (IPv4 + IPv6).
   -y, --yes               Не запрашивать подтверждений (неинтерактивный режим).
       --dot               Включить DNS-over-TLS + DNSSEC=allow-downgrade
                             (поддерживается для cloudflare/google/quad9).
@@ -38,10 +42,19 @@ PROVIDER=""
 ASSUME_YES=0
 USE_DOT=0
 ROLLBACK=0
+EXPLICIT_IFACES=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--provider) PROVIDER="${2:-}"; shift 2 ;;
+        -i|--interface)
+            # Поддерживаем как `-i eth0 -i eth1`, так и `-i eth0,eth1`.
+            IFS=', ' read -r -a __split <<< "${2:-}"
+            for __it in "${__split[@]}"; do
+                [ -n "$__it" ] && EXPLICIT_IFACES+=("$__it")
+            done
+            unset __split __it
+            shift 2 ;;
         -y|--yes)      ASSUME_YES=1; shift ;;
         --dot)         USE_DOT=1; shift ;;
         --rollback)    ROLLBACK=1; shift ;;
@@ -67,13 +80,14 @@ prompt_yes() {
     [[ "$ans" =~ ^[Yy]$ ]]
 }
 
-detect_interface() {
-    local iface=""
-    iface=$(ip -4 route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
-    if [ -z "$iface" ]; then
-        iface=$(ip -6 route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
-    fi
-    echo "$iface"
+# Вернуть все уникальные интерфейсы с default-маршрутом (IPv4 + IPv6),
+# по одному на строку. На multi-WAN машинах их может быть >1 —
+# обрабатывать нужно все, иначе на необработанных останутся DHCP-DNS.
+detect_interfaces() {
+    {
+        ip -4 route show default 2>/dev/null | awk '/^default/ {print $5}'
+        ip -6 route show default 2>/dev/null | awk '/^default/ {print $5}'
+    } | awk 'NF && !seen[$0]++'
 }
 
 warn_netplan_cloudinit() {
@@ -186,19 +200,21 @@ find_networkd_unit() {
     echo "$netfile"
 }
 
-# Создать drop-in для активного .network-юнита, запрещающий принимать DNS
-# от DHCP/RA на нашем интерфейсе. Срабатывает только если активен
-# systemd-networkd. NetworkManager ловится отдельно (no-dns.conf).
+# Создать drop-in для .network-юнита заданного интерфейса,
+# запрещающий принимать DNS от DHCP/RA. Срабатывает только если
+# активен systemd-networkd. NetworkManager ловится отдельно
+# (no-dns.conf). Возвращает 0, если drop-in создан, 1 иначе.
 configure_networkd_no_dns() {
-    if ! command -v systemctl >/dev/null 2>&1; then return 0; fi
+    local iface="$1"
+    if ! command -v systemctl >/dev/null 2>&1; then return 1; fi
     if ! systemctl is-active --quiet systemd-networkd 2>/dev/null; then
-        return 0
+        return 1
     fi
     local netfile
-    netfile="$(find_networkd_unit "$INTERFACE")"
+    netfile="$(find_networkd_unit "$iface")"
     if [ -z "$netfile" ]; then
-        echo -e "${YELLOW}⚠ systemd-networkd активен, но .network для $INTERFACE не найден — UseDNS=no не применяю.${NC}"
-        return 0
+        echo -e "${YELLOW}⚠ systemd-networkd активен, но .network для $iface не найден — UseDNS=no не применяю на $iface.${NC}"
+        return 1
     fi
     local base conf_dir
     base="$(basename "$netfile")"
@@ -211,8 +227,8 @@ UseDNS=no
 [IPv6AcceptRA]
 UseDNS=no
 EOF
-    echo -e "${GREEN}✓ systemd-networkd: $conf_dir/no-dhcp-dns.conf → UseDNS=no.${NC}"
-    systemctl restart systemd-networkd 2>/dev/null || true
+    echo -e "${GREEN}✓ systemd-networkd ($iface): $conf_dir/no-dhcp-dns.conf → UseDNS=no.${NC}"
+    return 0
 }
 
 # Удалить наши systemd-networkd drop-in'ы (для --rollback).
@@ -258,16 +274,60 @@ print_dns_layout() {
     fi
     if command -v systemctl >/dev/null 2>&1 \
             && systemctl is-active --quiet systemd-networkd 2>/dev/null; then
-        local netfile
-        netfile="$(find_networkd_unit "$INTERFACE")"
-        if [ -n "$netfile" ]; then
-            echo -e "  $netfile"
-            local base
-            base="$(basename "$netfile")"
-            if [ -f "/etc/systemd/network/${base}.d/no-dhcp-dns.conf" ]; then
-                echo -e "  /etc/systemd/network/${base}.d/no-dhcp-dns.conf"
+        local iface netfile base
+        for iface in "$@"; do
+            netfile="$(find_networkd_unit "$iface")"
+            if [ -n "$netfile" ]; then
+                echo -e "  $netfile"
+                base="$(basename "$netfile")"
+                if [ -f "/etc/systemd/network/${base}.d/no-dhcp-dns.conf" ]; then
+                    echo -e "  /etc/systemd/network/${base}.d/no-dhcp-dns.conf"
+                fi
             fi
+        done
+    fi
+}
+
+# Предупредить, если netplan описывает интерфейсы, которых в
+# системе нет (или не описывает реальные). Типичный кейс —
+# cloud-image netplan с `enp1s0`, а реальные интерфейсы ens3/ens4.
+warn_netplan_iface_mismatch() {
+    [ "$#" -ge 1 ] || return 0
+    compgen -G "/etc/netplan/*.yaml" >/dev/null 2>&1 || return 0
+    local netplan_ifaces
+    # Извлекаем имена из секций ethernets:/wifis:/bridges: (set-name или ключ).
+    # Парсим netplan YAML: ищем ключи под секциями ethernets/wifis/bridges/bonds/vlans
+    # и значения set-name (последние имеют приоритет, если присутствуют).
+    netplan_ifaces=$(awk '
+        function get_indent(s,    i) { for (i=1;i<=length(s);i++) if (substr(s,i,1)!=" ") return i-1; return length(s) }
+        /^[[:space:]]*(ethernets|wifis|bridges|bonds|vlans):[[:space:]]*$/ {
+            block_indent = get_indent($0); in_block = 1; child_indent = -1; next
+        }
+        in_block {
+            if (NF == 0) next
+            line_indent = get_indent($0)
+            if (line_indent <= block_indent) { in_block = 0; next }
+            if (child_indent < 0) child_indent = line_indent
+            if (line_indent == child_indent && /:[[:space:]]*$/) {
+                key = $1; sub(/:/, "", key); gsub(/["\047]/, "", key); print key
+            }
+            if (/^[[:space:]]+set-name:[[:space:]]*/) {
+                val = $2; gsub(/["\047]/, "", val); if (val != "") print val
+            }
+        }
+    ' /etc/netplan/*.yaml 2>/dev/null | awk 'NF && !seen[$0]++')
+    [ -n "$netplan_ifaces" ] || return 0
+    local iface missing=()
+    for iface in "$@"; do
+        if ! grep -qx "$iface" <<< "$netplan_ifaces"; then
+            missing+=("$iface")
         fi
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo -e "${YELLOW}⚠ netplan не описывает интерфейсы: ${missing[*]}.${NC}"
+        echo -e "${YELLOW}  netplan видит: $(echo "$netplan_ifaces" | tr '\n' ' ')."
+        echo -e "  Сеть на этих интерфейсах поднимает кто-то другой (cloud-init/ifupdown/вручную),${NC}"
+        echo -e "${YELLOW}  поэтому networkd UseDNS=no drop-in может не примениться — per-link DNS сбросится при DHCP-renew/ребуте.${NC}"
     fi
 }
 
@@ -302,10 +362,12 @@ rollback() {
 EOF
     echo -e "${GREEN}✓ /etc/systemd/resolved.conf сброшен к дефолтам.${NC}"
 
-    local iface
-    iface="$(detect_interface)"
-    if [ -n "$iface" ] && command -v resolvectl >/dev/null 2>&1; then
-        resolvectl revert "$iface" 2>/dev/null || true
+    if command -v resolvectl >/dev/null 2>&1; then
+        local iface
+        while IFS= read -r iface; do
+            [ -n "$iface" ] || continue
+            resolvectl revert "$iface" 2>/dev/null || true
+        done < <(detect_interfaces)
     fi
 
     systemctl restart systemd-resolved 2>/dev/null || true
@@ -324,13 +386,30 @@ fi
 # ------------------------------------------------------------
 # main
 # ------------------------------------------------------------
-INTERFACE="$(detect_interface)"
-if [ -z "$INTERFACE" ]; then
-    echo -e "${RED}Ошибка: не удалось определить активный интерфейс по таблице маршрутизации.${NC}"
-    echo -e "${RED}       Проверь: ip -4 route show default${NC}"
+INTERFACES=()
+if [ "${#EXPLICIT_IFACES[@]}" -gt 0 ]; then
+    INTERFACES=("${EXPLICIT_IFACES[@]}")
+else
+    while IFS= read -r __iface; do
+        [ -n "$__iface" ] && INTERFACES+=("$__iface")
+    done < <(detect_interfaces)
+    unset __iface
+fi
+
+if [ "${#INTERFACES[@]}" -eq 0 ]; then
+    echo -e "${RED}Ошибка: не удалось определить активные интерфейсы по таблице маршрутизации.${NC}"
+    echo -e "${RED}       Проверь: ip -4 route show default ; ip -6 route show default${NC}"
+    echo -e "${RED}       Или укажи явно: $SCRIPT_NAME -i <iface>${NC}"
     exit 1
 fi
-echo -e "${CYAN}Активный интерфейс: ${GREEN}$INTERFACE${NC}"
+
+# Первый интерфейс считаем «основным» — используется в сообщениях.
+INTERFACE="${INTERFACES[0]}"
+if [ "${#INTERFACES[@]}" -eq 1 ]; then
+    echo -e "${CYAN}Активный интерфейс: ${GREEN}$INTERFACE${NC}"
+else
+    echo -e "${CYAN}Активные интерфейсы (default route): ${GREEN}${INTERFACES[*]}${NC}"
+fi
 
 # Map provider → DNS values
 set_provider() {
@@ -389,6 +468,7 @@ echo -e "${YELLOW}Применяю: ${GREEN}$LABEL${YELLOW} → $DNS1, $DNS2${NC
 
 # Step 0: предупредить про netplan/cloud-init и опционально отключить cloud-init network management
 warn_netplan_cloudinit
+warn_netplan_iface_mismatch "${INTERFACES[@]}"
 
 # Step 1: NetworkManager
 if command -v nmcli >/dev/null 2>&1; then
@@ -435,20 +515,28 @@ Cache=yes
 EOF
 echo -e "${GREEN}✓ /etc/systemd/resolved.conf обновлён.${NC}"
 
-# Step 4: запретить systemd-networkd принимать DNS из DHCP/RA на интерфейсе.
-configure_networkd_no_dns
+# Step 4: запретить systemd-networkd принимать DNS из DHCP/RA на каждом интерфейсе.
+for IFACE in "${INTERFACES[@]}"; do
+    configure_networkd_no_dns "$IFACE" || true
+done
+# Рестарт networkd один раз после всех drop-in'ов.
+if command -v systemctl >/dev/null 2>&1 \
+        && systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+    systemctl restart systemd-networkd 2>/dev/null || true
+fi
 
-# Step 5: применить новые настройки networkd к УЖЕ работающему линку.
+# Step 5: применить новые настройки networkd к УЖЕ работающим линкам.
 # `systemctl restart systemd-networkd` сам по себе не перенастраивает
 # активные интерфейсы — старая DHCP-аренда и кэш per-link DNS остаются.
-# `networkctl reload && networkctl reconfigure` форсируют пере-сборку
-# конфигурации интерфейса с учётом нового drop-in (UseDNS=no).
+# `networkctl reload && networkctl reconfigure` форсируют пере-сборку.
 if command -v networkctl >/dev/null 2>&1 \
         && systemctl is-active --quiet systemd-networkd 2>/dev/null; then
     networkctl reload 2>/dev/null || true
-    if networkctl reconfigure "$INTERFACE" 2>/dev/null; then
-        echo -e "${GREEN}✓ networkctl reconfigure $INTERFACE.${NC}"
-    fi
+    for IFACE in "${INTERFACES[@]}"; do
+        if networkctl reconfigure "$IFACE" 2>/dev/null; then
+            echo -e "${GREEN}✓ networkctl reconfigure $IFACE.${NC}"
+        fi
+    done
 fi
 
 # Step 6: рестарт systemd-resolved и принудительная установка per-link DNS.
@@ -467,12 +555,14 @@ systemctl restart systemd-resolved
 echo -e "${GREEN}✓ systemd-resolved перезапущен.${NC}"
 
 if command -v resolvectl >/dev/null 2>&1; then
-    resolvectl revert "$INTERFACE" 2>/dev/null || true
-    if resolvectl dns "$INTERFACE" "$DNS1" "$DNS2" 2>/dev/null; then
-        echo -e "${GREEN}✓ Per-link DNS на $INTERFACE: $DNS1 $DNS2.${NC}"
-    else
-        echo -e "${YELLOW}⚠ Не удалось задать per-link DNS на $INTERFACE через resolvectl.${NC}"
-    fi
+    for IFACE in "${INTERFACES[@]}"; do
+        resolvectl revert "$IFACE" 2>/dev/null || true
+        if resolvectl dns "$IFACE" "$DNS1" "$DNS2" 2>/dev/null; then
+            echo -e "${GREEN}✓ Per-link DNS на $IFACE: $DNS1 $DNS2.${NC}"
+        else
+            echo -e "${YELLOW}⚠ Не удалось задать per-link DNS на $IFACE через resolvectl.${NC}"
+        fi
+    done
     resolvectl flush-caches 2>/dev/null || true
 fi
 
@@ -491,14 +581,14 @@ echo -e "${YELLOW}Проверяю применённые DNS...${NC}"
 sleep 1
 
 echo -e "${CYAN}Глобальные DNS серверы:${NC}"
-resolvectl status 2>/dev/null | grep -E "DNS Servers|Fallback" | head -4 || true
+resolvectl status 2>/dev/null | grep -E "DNS Servers|Fallback" | head -8 || true
 
 echo ""
 echo -e "${CYAN}Тест резолвинга ($TEST_DOMAIN):${NC}"
 test_resolve "$TEST_DOMAIN" || echo -e "${RED}⚠ Не удалось проверить резолвинг.${NC}"
 
 echo ""
-print_dns_layout
+print_dns_layout "${INTERFACES[@]}"
 
 echo ""
 echo -e "${GREEN}Готово! Установлен: $LABEL ($DNS1, $DNS2)${NC}"
