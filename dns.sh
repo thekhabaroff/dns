@@ -80,13 +80,32 @@ prompt_yes() {
     [[ "$ans" =~ ^[Yy]$ ]]
 }
 
-# Вернуть все уникальные интерфейсы с default-маршрутом (IPv4 + IPv6),
-# по одному на строку. На multi-WAN машинах их может быть >1 —
-# обрабатывать нужно все, иначе на необработанных останутся DHCP-DNS.
+# Вернуть все уникальные интерфейсы с default-маршрутом, по одному на строку.
+# Источников два:
+#  1) Kernel routing: `ip -4/-6 route show default` — реальные kernel-маршруты.
+#  2) systemd-resolved: линки с флагом `+DefaultRoute` в `resolvectl status`.
+#     Этот флаг ставится независимо от kernel routing (через [Network]
+#     DefaultRouteOnDevice= или DHCP-маршрут) и означает «resolved готов
+#     использовать этот линк для default-domain DNS-запросов». На multi-WAN
+#     машинах второй интерфейс может не иметь kernel default route, но
+#     иметь +DefaultRoute — и тогда часть DNS-запросов всё равно уйдёт через
+#     него, поэтому его надо обрабатывать тоже.
 detect_interfaces() {
     {
         ip -4 route show default 2>/dev/null | awk '/^default/ {print $5}'
         ip -6 route show default 2>/dev/null | awk '/^default/ {print $5}'
+        if command -v resolvectl >/dev/null 2>&1; then
+            resolvectl status 2>/dev/null | awk '
+                /^Link [0-9]+ \(/ {
+                    name = $0
+                    sub(/^Link [0-9]+ \(/, "", name)
+                    sub(/\).*$/, "", name)
+                    current = name
+                    next
+                }
+                /\+DefaultRoute/ && current != "" { print current; current = "" }
+            '
+        fi
     } | awk 'NF && !seen[$0]++'
 }
 
