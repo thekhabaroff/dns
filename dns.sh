@@ -19,14 +19,14 @@ Usage: $SCRIPT_NAME [options]
 
 Options:
   -p, --provider <name>   Выбрать DNS-провайдер без меню:
-                            yandex | cloudflare | google | quad9
+                            yandex | alidns | cloudflare | google | quad9
   -i, --interface <iface> Обработать только этот интерфейс (можно
                             повторять или списком через запятую).
                             По умолчанию берём все интерфейсы
                             с default route (IPv4 + IPv6).
   -y, --yes               Не запрашивать подтверждений (неинтерактивный режим).
       --dot               Включить DNS-over-TLS + DNSSEC=allow-downgrade
-                            (поддерживается для cloudflare/google/quad9).
+                            (поддерживается для alidns/cloudflare/google/quad9).
       --rollback          Откатить изменения, сделанные этим скриптом.
   -h, --help              Показать это сообщение.
 
@@ -437,13 +437,16 @@ set_provider() {
         1|yandex)
             DNS1="77.88.8.8";  DNS2="77.88.8.1"
             LABEL="Yandex DNS"; TEST_DOMAIN="dns.yandex.ru"; PROVIDER_KEY="yandex" ;;
-        2|cloudflare|cf)
+        2|alidns|ali)
+            DNS1="223.5.5.5";  DNS2="223.6.6.6"
+            LABEL="AliDNS"; TEST_DOMAIN="dns.alidns.com"; PROVIDER_KEY="alidns" ;;
+        3|cloudflare|cf)
             DNS1="1.1.1.1";    DNS2="1.0.0.1"
             LABEL="Cloudflare DNS"; TEST_DOMAIN="cloudflare.com"; PROVIDER_KEY="cloudflare" ;;
-        3|google)
+        4|google)
             DNS1="8.8.8.8";    DNS2="8.8.4.4"
             LABEL="Google DNS"; TEST_DOMAIN="dns.google"; PROVIDER_KEY="google" ;;
-        4|quad9)
+        5|quad9)
             DNS1="9.9.9.9";    DNS2="149.112.112.112"
             LABEL="Quad9 DNS"; TEST_DOMAIN="dns.quad9.net"; PROVIDER_KEY="quad9" ;;
         *) return 1 ;;
@@ -455,11 +458,12 @@ if [ -z "$PROVIDER" ]; then
     echo ""
     echo -e "${YELLOW}Выбери DNS-провайдер:${NC}"
     echo -e "${RED}1.${NC} Yandex DNS           (77.88.8.8,   77.88.8.1)"
-    echo -e "${RED}2.${NC} Cloudflare DNS       (1.1.1.1,     1.0.0.1)"
-    echo -e "${RED}3.${NC} Google DNS           (8.8.8.8,     8.8.4.4)"
-    echo -e "${RED}4.${NC} Quad9 DNS            (9.9.9.9,     149.112.112.112)"
+    echo -e "${RED}2.${NC} AliDNS               (223.5.5.5,   223.6.6.6)"
+    echo -e "${RED}3.${NC} Cloudflare DNS       (1.1.1.1,     1.0.0.1)"
+    echo -e "${RED}4.${NC} Google DNS           (8.8.8.8,     8.8.4.4)"
+    echo -e "${RED}5.${NC} Quad9 DNS            (9.9.9.9,     149.112.112.112)"
     echo ""
-    read -rp "Введи номер (1-4): " PROVIDER
+    read -rp "Введи номер (1-5): " PROVIDER
 fi
 
 if ! set_provider "$PROVIDER"; then
@@ -472,7 +476,7 @@ DOT_LINE="DNSOverTLS=no"
 DNSSEC_LINE="DNSSEC=no"
 if [ "$USE_DOT" -eq 1 ]; then
     case "$PROVIDER_KEY" in
-        cloudflare|quad9|google)
+        alidns|cloudflare|quad9|google)
             DOT_LINE="DNSOverTLS=opportunistic"
             DNSSEC_LINE="DNSSEC=allow-downgrade"
             ;;

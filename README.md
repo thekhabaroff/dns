@@ -1,13 +1,13 @@
 # dns.sh — смена DNS на Ubuntu VPS
 
 Небольшой bash-скрипт, который переключает резолвер Ubuntu на один из публичных
-DNS-провайдеров (Yandex / Cloudflare / Google / Quad9), не позволяя
+DNS-провайдеров (Yandex / AliDNS / Cloudflare / Google / Quad9), не позволяя
 NetworkManager и dhclient перетереть настройки.
 
 ## Установка
 
 ```shell
-curl -fsSL https://raw.githubusercontent.com/thekhabaroff/dns/master/dns.sh \
+curl -fsSL https://raw.githubusercontent.com/thekhabaroff/dns/devin/alidns/dns.sh \
   -o /usr/local/bin/dns && chmod +x /usr/local/bin/dns && sudo dns
 ```
 
@@ -37,6 +37,7 @@ dns --help
 | Ключ          | Серверы                              |
 | ------------- | ------------------------------------ |
 | `yandex`      | 77.88.8.8, 77.88.8.1                 |
+| `alidns`      | 223.5.5.5, 223.6.6.6                 |
 | `cloudflare`  | 1.1.1.1, 1.0.0.1                     |
 | `google`      | 8.8.8.8, 8.8.4.4                     |
 | `quad9`       | 9.9.9.9, 149.112.112.112             |
@@ -120,7 +121,7 @@ sudo dns --rollback
 
 | Флаг                  | Назначение                                                              |
 | --------------------- | ----------------------------------------------------------------------- |
-| `-p, --provider NAME` | `yandex` / `cloudflare` / `google` / `quad9` (без меню).                |
+| `-p, --provider NAME` | `yandex` / `alidns` / `cloudflare` / `google` / `quad9` (без меню).     |
 | `-y, --yes`           | Неинтерактивный режим: все вопросы — «да».                              |
 | `--dot`               | DNS-over-TLS (`opportunistic`) + DNSSEC (`allow-downgrade`).            |
 | `--rollback`          | Откатить все изменения скрипта.                                         |
